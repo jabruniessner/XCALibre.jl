@@ -27,7 +27,8 @@ This function returns a `NamedTuple` for accessing the residuals (e.g. `residual
 """
 function simple!(
     model, config;
-    output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false
+    output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false,
+    boundedturb=false, wallfn_v2=false
     )
 
     residuals = setup_incompressible_solvers(
@@ -37,7 +38,9 @@ function simple!(
         ncorrectors=ncorrectors,
         inner_loops=inner_loops,
         consistent=consistent,
-        linearupwind=linearupwind
+        linearupwind=linearupwind,
+        boundedturb=boundedturb,
+        wallfn_v2=wallfn_v2
         )
 
     return residuals
@@ -46,7 +49,8 @@ end
 # Setup for all incompressible algorithms
 function setup_incompressible_solvers(
     solver_variant, model, config;
-    output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false
+    output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false,
+    boundedturb=false, wallfn_v2=false
     )
 
     (; solvers, schemes, runtime, hardware, boundaries) = config
@@ -99,14 +103,17 @@ function setup_incompressible_solvers(
         ncorrectors=ncorrectors,
         inner_loops=inner_loops,
         consistent=consistent,
-        linearupwind=linearupwind)
+        linearupwind=linearupwind,
+        boundedturb=boundedturb,
+        wallfn_v2=wallfn_v2)
 
     return residuals
 end # end function
 
 function SIMPLE(
     model, turbulenceModel, ∇p, U_eqn, p_eqn, config;
-    output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false
+    output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false,
+    boundedturb=false, wallfn_v2=false
     )
 
     if consistent
@@ -147,7 +154,6 @@ function SIMPLE(
     rD = ScalarField(mesh)
     sumOff = ScalarField(mesh) # SIMPLEC: sum of |off-diagonal| momentum coefficients per cell
     rAtU = ScalarField(mesh)   # SIMPLEC: V/(A_ii - sumOff), replaces rD when consistent=true
-    rAUf = FaceScalarField(mesh) # SIMPLEC: face-interpolated plain rD, needed for the flux correction
 
     # Pre-allocate auxiliary variables
     TF = _get_float(mesh)
@@ -239,13 +245,10 @@ function SIMPLE(
 
         interpolate!(rDf, pCoeff, config)
         correct_interpolation_periodic(rDf, pCoeff, boundaries.U, config)
-        if consistent
-            interpolate!(rAUf, rD, config)
-        end
         remove_pressure_source!(U_eqn, ∇p, config)
         H!(Hv, U, U_eqn, config)
 
-        if consistent && get(ENV, "XCALIBRE_SIMPLEC_SKIP_HV", "0") != "1"
+        if consistent
             # HbyA -= (rAU - rAtU)*grad(p)  (using the still-previous-iteration ∇p)
             simplec_correct_Hv!(Hv, rD, rAtU, ∇p, config)
         end
@@ -259,27 +262,6 @@ function SIMPLE(
 
         # new approach
         flux!(mdotf, Uf, config)
-
-        # NOTE: this RHS flux-correction term (matching OpenFOAM's
-        # phiHbyA += interpolate(rAtU-rAU)*snGrad(p)*magSf) was found by
-        # direct validation (small non-orthogonal duct case, compared
-        # cell-by-cell against OpenFOAM) to make results WORSE, not better --
-        # disabled by default. The Hv correction below is sufficient and
-        # matches OpenFOAM closely on its own. Kept togglable for further
-        # investigation of why this term doesn't help in XCALibre's
-        # architecture (possibly redundant with/inconsistent with how Hv's
-        # correction already propagates through the standard
-        # interpolate!->flux! pipeline).
-        if consistent && get(ENV, "XCALIBRE_SIMPLEC_SKIP_FLUXCORR", "1") != "1"
-            # phiHbyA += interpolate(rAtU - rAU)*snGrad(p)*magSf, built using
-            # the SAME per-face non-orthogonal-correction coefficient
-            # (Ef_mag/delta) that XCALibre's own Laplacian{Linear} scheme
-            # uses to assemble the pressure matrix -- this is what keeps the
-            # RHS flux and LHS Laplacian coefficient consistent with each
-            # other, which plain cell-centred-gradient interpolation of the
-            # corrected Hv does not guarantee.
-            simplec_flux_correction!(mdotf, rDf, rAUf, p, config)
-        end
 
         div!(divHv, mdotf, config)
         
@@ -309,31 +291,7 @@ function SIMPLE(
         correct_mass_flux!(mdotf, p_eqn, config; time=time)
         correct_velocity!(U, Hv, ∇p, pCoeff, config)
 
-        # Defensive field bounding (opt-in): mirrors OpenFOAM's practice of
-        # clamping fields so a handful of pathological mesh cells (tiny
-        # volume / skewed interpolation weight, e.g. from snappyHexMesh
-        # slivers) cannot produce an unbounded single-iteration correction
-        # that runs away exponentially. Off by default; enable with
-        # XCALIBRE_BOUND_FIELDS=1. Bounds default to generous multiples of
-        # the problem's velocity scale but can be overridden via
-        # XCALIBRE_BOUND_UMAX / XCALIBRE_BOUND_PMAX (same units as U, p).
-        if get(ENV, "XCALIBRE_BOUND_FIELDS", "0") == "1"
-            Umax = parse(Float64, get(ENV, "XCALIBRE_BOUND_UMAX", "500.0"))
-            Pmax = parse(Float64, get(ENV, "XCALIBRE_BOUND_PMAX", "50000.0"))
-            if get(ENV, "XCALIBRE_BOUND_DIAG", "0") == "1"
-                rawU = maximum(abs.(U.x.values))
-                rawP = maximum(abs.(p.values))
-                open(joinpath(pwd(), "boundlog.csv"), "a") do io
-                    println(io, "$iteration,$rawU,$rawP")
-                end
-            end
-            @. U.x.values = clamp(U.x.values, -Umax, Umax)
-            @. U.y.values = clamp(U.y.values, -Umax, Umax)
-            @. U.z.values = clamp(U.z.values, -Umax, Umax)
-            @. p.values = clamp(p.values, -Pmax, Pmax)
-        end
-
-        turbulence!(turbulenceModel, model, S, prev, time, config)
+        turbulence!(turbulenceModel, model, S, prev, time, config; boundedturb=boundedturb, wallfn_v2=wallfn_v2)
         if linearupwind
             # OpenFOAM's actual scheme is `linearUpwindV grad(U)` with
             # `grad(U)  cellLimited Gauss linear 1;` -- the extrapolation
@@ -499,51 +457,6 @@ end
         Hx[i] -= delta * dpdx[i]
         Hy[i] -= delta * dpdy[i]
         Hz[i] -= delta * dpdz[i]
-    end
-end
-
-# phiHbyA += interpolate(rAtU - rAU)*snGrad(p)*magSf  -- OpenFOAM pEqn.H's
-# SIMPLEC RHS flux correction, built with XCALibre's own Ef_mag/delta
-# non-orthogonal-correction coefficient (see scheme! for Laplacian{Linear}
-# in Discretise_1_schemes.jl) so this correction is discretely consistent
-# with the Laplacian(rAtU, p) term on the LHS of the pressure equation.
-function simplec_flux_correction!(mdotf, rDf, rAUf, p, config)
-    (; faces, boundary_cellsID) = mdotf.mesh
-    (; hardware) = config
-    (; backend, workgroup) = hardware
-
-    n_faces = length(faces)
-    n_bfaces = length(boundary_cellsID)
-    n_ifaces = n_faces - n_bfaces
-
-    ndrange = n_ifaces
-    kernel! = _simplec_flux_correction!(_setup(backend, workgroup, ndrange)...)
-    kernel!(mdotf, rDf, rAUf, p, faces, n_bfaces)
-end
-
-@kernel function _simplec_flux_correction!(mdotf, rDf, rAUf, p, faces, n_bfaces)
-    i = @index(Global)
-    @uniform begin
-        mvals = mdotf.values
-        rDfvals = rDf.values
-        rAUfvals = rAUf.values
-        pvals = p.values
-    end
-    @inbounds begin
-        fID = i + n_bfaces
-        face = faces[fID]
-        (; area, normal, delta, e, ownerCells) = face
-        cID1 = ownerCells[1]
-        cID2 = ownerCells[2]
-
-        Sf = area*normal
-        Ef = ((Sf⋅Sf)/(Sf⋅e))*e
-        Ef_mag = norm(Ef)
-        deltaCoeff = Ef_mag/delta
-
-        Δr = rDfvals[fID] - rAUfvals[fID]
-        signflip = get(ENV, "XCALIBRE_SIMPLEC_FLUXCORR_SIGN", "1") == "-1" ? -one(delta) : one(delta)
-        mvals[fID] += signflip*Δr*deltaCoeff*(pvals[cID2] - pvals[cID1])
     end
 end
 

@@ -188,7 +188,8 @@ Run turbulence model transport equations.
 
 """
 function turbulence!(
-    rans::KOmegaSSTModel{E1,E2,S1}, model::Physics{T,F,SO,M,Tu,E,D,BI}, S, prev, time, config
+    rans::KOmegaSSTModel{E1,E2,S1}, model::Physics{T,F,SO,M,Tu,E,D,BI}, S, prev, time, config;
+    boundedturb::Bool=false, wallfn_v2::Bool=false
     ) where {T,F,SO,M,Tu<:AbstractTurbulenceModel,E,D,BI,E1,E2,S1}
 
     mesh = model.domain
@@ -272,7 +273,7 @@ function turbulence!(
         10*coeffs.β⁺*k.values*omega.values
     )
 
-    correct_production!(Pk, boundaries.k, model, S.gradU, config) # Must be after Pk
+    correct_production!(Pk, boundaries.k, model, S.gradU, config, wallfn_v2) # Must be after Pk
     @. dkdomegadx.values = begin
         # 2*(F1.values - 1)*rho.values*coeffs.σω2*dkdomegadx.values/omega.values # explicit 
         2*(F1.values - 1)*rho.values*coeffs.σω2*dkdomegadx.values/omega.values/omega.values
@@ -282,7 +283,7 @@ function turbulence!(
     # Solve omega equation
     # prev .= omega.values
     discretise!(ω_eqn, omega, config)
-    if get(ENV, "XCALIBRE_BOUNDED_TURB", "0") == "1"
+    if boundedturb
         # OpenFOAM's actual scheme is `turbulence bounded Gauss upwind;`
         # applied to div(phi,k) and div(phi,omega) too, not just U -- same
         # mass-imbalance diagonal correction as bounded_convection_correction!,
@@ -292,7 +293,7 @@ function turbulence!(
     apply_boundary_conditions!(ω_eqn, boundaries.omega, nothing, time, config)
     # implicit_relaxation!(ω_eqn, omega.values, solvers.omega.relax, nothing, config)
     implicit_relaxation_diagdom!(ω_eqn, omega.values, solvers.omega.relax, nothing, config)
-    constrain_equation!(ω_eqn, boundaries.omega, model, config) # active with WFs only
+    constrain_equation!(ω_eqn, boundaries.omega, model, config, wallfn_v2) # active with WFs only
     update_preconditioner!(ω_eqn.preconditioner, mesh, config)
     ω_res = solve_system!(ω_eqn, solvers.omega, omega, nothing, config)
     
@@ -303,7 +304,7 @@ function turbulence!(
     # Solve k equation
     # prev .= k.values
     discretise!(k_eqn, k, config)
-    if get(ENV, "XCALIBRE_BOUNDED_TURB", "0") == "1"
+    if boundedturb
         bounded_convection_correction_scalar!(k_eqn, get_flux(k_eqn, 2), config)
     end
     apply_boundary_conditions!(k_eqn, boundaries.k, nothing, time, config)
@@ -322,7 +323,7 @@ function turbulence!(
 
     interpolate!(nutf, nut, config)
     correct_boundaries!(nutf, nut, boundaries.nut, time, config)
-    correct_eddy_viscosity!(nutf, boundaries.nut, model, config)
+    correct_eddy_viscosity!(nutf, boundaries.nut, model, config, wallfn_v2)
 
     state.residuals = ((:k , k_res),(:omega, ω_res))
     state.converged = k_res < solvers.k.convergence && ω_res < solvers.omega.convergence

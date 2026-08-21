@@ -73,7 +73,7 @@ nut_wall_v2(nu, yplus, kappa, E::T, yPlusLam) where T = begin
     yplus > yPlusLam ? nu*yplus*kappa/log(max(E*yplus, 1.0 + 1e-4)) : nu
 end
 
-@generated correct_production!(P, fieldBCs, model, gradU, config) = begin
+@generated correct_production!(P, fieldBCs, model, gradU, config, wallfn_v2=false) = begin
     BCs = fieldBCs.parameters
     func_calls = Expr[]
     for i ∈ eachindex(BCs)
@@ -84,7 +84,7 @@ end
     end
     quote
     wallCount = nothing
-    if get(ENV, "XCALIBRE_WALLFN_V2", "0") == "1"
+    if wallfn_v2
         mesh = model.domain
         (; hardware) = config
         wallCount = KernelAbstractions.zeros(hardware.backend, _get_float(mesh), length(mesh.cells))
@@ -210,26 +210,26 @@ end
     end
 end
 
-@generated function correct_eddy_viscosity!(νtf, nutBCs, model, config)
+@generated function correct_eddy_viscosity!(νtf, nutBCs, model, config, wallfn_v2=false)
     unpacked_BCs = []
     for i ∈ 1:length(nutBCs.parameters)
         unpack = quote
-            correct_nut_wall!(νtf, nutBCs[$i], model, config)
+            correct_nut_wall!(νtf, nutBCs[$i], model, config, wallfn_v2)
         end
         push!(unpacked_BCs, unpack)
     end
     quote
-    $(unpacked_BCs...) 
+    $(unpacked_BCs...)
     end
 end
 
-correct_nut_wall!(nutf, BC, model, config) = nothing
+correct_nut_wall!(nutf, BC, model, config, wallfn_v2=false) = nothing
 
-function correct_nut_wall!(νtf, BC::NutWallFunction, model, config)
+function correct_nut_wall!(νtf, BC::NutWallFunction, model, config, wallfn_v2=false)
     # backend = _get_backend(mesh)
     (; hardware) = config
     (; backend, workgroup) = hardware
-    
+
     # Deconstruct mesh to required fields
     mesh = model.domain
     (; faces, boundary_cellsID, boundaries) = mesh
@@ -244,7 +244,7 @@ function correct_nut_wall!(νtf, BC::NutWallFunction, model, config)
     start_ID = facesID_range[1]
 
     # Execute apply boundary conditions kernel
-    fixed = get(ENV, "XCALIBRE_WALLFN_V2", "0") == "1"
+    fixed = wallfn_v2
     ndrange=length(facesID_range)
     kernel! = _correct_nut_wall!(_setup(backend, workgroup, ndrange)...)
     kernel!(νtf.values, fluid, turbulence, BC, faces, boundary_cellsID, start_ID, fixed)
@@ -278,7 +278,7 @@ end
     end
 end
 
-function correct_nut_wall!(νtf, BC::NutMixingLengthWallFunction, model, config)
+function correct_nut_wall!(νtf, BC::NutMixingLengthWallFunction, model, config, wallfn_v2=false)
     (; hardware) = config
     (; backend, workgroup) = hardware
 
@@ -336,7 +336,7 @@ end
     end
 end
 
-@generated constrain_equation!(eqn, fieldBCs, model, config) = begin
+@generated constrain_equation!(eqn, fieldBCs, model, config, wallfn_v2=false) = begin
     BCs = fieldBCs.parameters
     old_calls = Expr[]
     count_calls = Expr[]
@@ -349,7 +349,7 @@ end
         push!(finalize_calls, :(finalize_omega_wall!(omega0, wallCount, eqn, fieldBCs[$i], model, config)))
     end
     quote
-    if get(ENV, "XCALIBRE_WALLFN_V2", "0") == "1"
+    if wallfn_v2
         # OpenFOAM's omegaWallFunctionFvPatchScalarField::calculate sums
         # weighted contributions from every wall-function face touching a
         # cell (weight = 1/count) before constraining the equation once

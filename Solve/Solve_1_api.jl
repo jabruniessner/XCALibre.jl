@@ -126,8 +126,11 @@ end
             netFlux += mvals[fID]*nsign
         end
         cIndex = spindex(rowptr, colval, i, i)
-        signflip = get(ENV, "XCALIBRE_BOUNDED_SIGN", "1") == "-1" ? -one(netFlux) : one(netFlux)
-        Atomix.@atomic nzval[cIndex] -= signflip*netFlux
+        # Sign verified empirically against OpenFOAM: -Sp(surfaceIntegrate(phi), vf)
+        # subtracts from the diagonal in OpenFOAM's convention, which corresponds
+        # to *adding* netFlux here given this codebase's matrix-assembly sign
+        # convention (opposite of the naive derivation from the formula alone).
+        Atomix.@atomic nzval[cIndex] += netFlux
     end
 end
 
@@ -137,8 +140,7 @@ end
     @inbounds begin
         cID = faces[i].ownerCells[1]
         cIndex = spindex(rowptr, colval, cID, cID)
-        signflip = get(ENV, "XCALIBRE_BOUNDED_SIGN", "1") == "-1" ? -one(eltype(mvals)) : one(eltype(mvals))
-        Atomix.@atomic nzval[cIndex] -= signflip*mvals[i]
+        Atomix.@atomic nzval[cIndex] += mvals[i]
     end
 end
 
@@ -157,8 +159,7 @@ end
         d = centre - cells[upC].centre
         dU = gradU[upC] * d # linear extrapolation from the upwind cell to the face
 
-        signflip = get(ENV, "XCALIBRE_LINUPW_SIGN", "1") == "-1" ? -one(mdot) : one(mdot)
-        corr = signflip * mdot * dU
+        corr = mdot * dU
 
         Atomix.@atomic bx[cID1] -= corr[1]
         Atomix.@atomic by[cID1] -= corr[2]
@@ -409,12 +410,8 @@ function solve_equation!(
 
     discretise!(psiEqn, psi, config, rho_prev=rho_prev)
     if !isnothing(gradU)
-        if get(ENV, "XCALIBRE_SKIP_LINUPW_GRAD", "0") != "1"
-            linearUpwindV_correction!(psiEqn, mdotf, gradU, config)
-        end
-        if get(ENV, "XCALIBRE_SKIP_BOUNDED", "0") != "1"
-            bounded_convection_correction!(psiEqn, mdotf, config)
-        end
+        linearUpwindV_correction!(psiEqn, mdotf, gradU, config)
+        bounded_convection_correction!(psiEqn, mdotf, config)
     end
     update_equation!(psiEqn, config)
     
