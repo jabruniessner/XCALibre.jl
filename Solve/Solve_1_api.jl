@@ -383,8 +383,12 @@ function solve_equation!(
 
     discretise!(psiEqn, psi, config, rho_prev=rho_prev)
     if !isnothing(gradU)
-        linearUpwindV_correction!(psiEqn, mdotf, gradU, config)
-        bounded_convection_correction!(psiEqn, mdotf, config)
+        if get(ENV, "XCALIBRE_SKIP_LINUPW_GRAD", "0") != "1"
+            linearUpwindV_correction!(psiEqn, mdotf, gradU, config)
+        end
+        if get(ENV, "XCALIBRE_SKIP_BOUNDED", "0") != "1"
+            bounded_convection_correction!(psiEqn, mdotf, config)
+        end
     end
     update_equation!(psiEqn, config)
     

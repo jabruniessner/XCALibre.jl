@@ -334,6 +334,19 @@ function SIMPLE(
         end
 
         turbulence!(turbulenceModel, model, S, prev, time, config)
+        if linearupwind
+            # OpenFOAM's actual scheme is `linearUpwindV grad(U)` with
+            # `grad(U)  cellLimited Gauss linear 1;` -- the extrapolation
+            # gradient is limited, not raw. Confirmed by ablation: the
+            # bounded (mass-imbalance) correction alone is stable for 350+
+            # iterations, but the raw/unlimited gradient extrapolation in
+            # linearUpwindV_correction! diverges on its own, locking onto
+            # one persistent cell -- exactly what an unbounded linear
+            # extrapolation would do near a poor-quality cell. Limiting
+            # gradU the same way OpenFOAM does is the fix, not a flux/TVD
+            # limiter on the correction itself.
+            limit_gradient!(CellBased(), gradU, U, config)
+        end
         update_nueff!(nueff, nu, model.turbulence, config)
 
         R_ux[iteration] = rx
