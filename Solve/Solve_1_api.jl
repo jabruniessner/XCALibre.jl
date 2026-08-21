@@ -3,7 +3,7 @@ export explicit_relaxation!, implicit_relaxation!, implicit_relaxation_diagdom!,
 export solve_system!
 export solve_equation!
 export AdaptiveTimeStepping
-export linearUpwindV_correction!, bounded_convection_correction!
+export linearUpwindV_correction!, bounded_convection_correction!, bounded_convection_correction_scalar!
 
 # linearUpwindV deferred correction (opt-in, gradU=nothing is a no-op):
 # adds the explicit second-order correction mdot_f*(x_f - x_C)*gradPhi_C on
@@ -86,6 +86,32 @@ function bounded_convection_correction!(psiEqn, mdotf, config)
             println(io, "$mx,$ix,$(sum(abs.(netFlux)))")
         end
     end
+end
+
+# Scalar-equation variant (k, omega, ...): unlike the momentum equation,
+# scalar transport equations here have no per-component reset cycle (no
+# _A0/update_equation! duality -- solved once per outer iteration, not
+# segregated into x/y/z), so the correction can target the working matrix
+# directly. Same "bounded" formula as the vector version.
+function bounded_convection_correction_scalar!(psiEqn, mdotf, config)
+    mesh = mdotf.mesh
+    (; cells, cell_nsign, cell_faces, faces, boundary_cellsID) = mesh
+    (; hardware) = config
+    (; backend, workgroup) = hardware
+
+    A = _A(psiEqn)
+    nzval = _nzval(A)
+    colval = _colval(A)
+    rowptr = _rowptr(A)
+
+    ndrange = length(cells)
+    kernel! = _bounded_convection_correction_internal!(_setup(backend, workgroup, ndrange)...)
+    kernel!(nzval, colval, rowptr, cell_faces, cell_nsign, mdotf, cells)
+
+    nbfaces = length(boundary_cellsID)
+    ndrange2 = nbfaces
+    kernel2! = _bounded_convection_correction_boundary!(_setup(backend, workgroup, ndrange2)...)
+    kernel2!(nzval, colval, rowptr, faces, mdotf)
 end
 
 @kernel function _bounded_convection_correction_internal!(nzval, colval, rowptr, cell_faces, cell_nsign, mdotf, cells)
