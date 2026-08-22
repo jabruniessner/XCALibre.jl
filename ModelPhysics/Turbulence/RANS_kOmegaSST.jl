@@ -99,7 +99,8 @@ Initialisation of turbulent transport equations.
 
 """
 function initialise(
-    turbulence::KOmegaSST, model::Physics{T,F,SO,M,Tu,E,D,BI}, mdotf, peqn, config
+    turbulence::KOmegaSST, model::Physics{T,F,SO,M,Tu,E,D,BI}, mdotf, peqn, config;
+    meshwave::Bool=false
     ) where {T,F,SO,M,Tu,E,D,BI}
 
     (; solvers, schemes, runtime, hardware) = config
@@ -164,7 +165,11 @@ function initialise(
     @reset k_eqn.solver = _workspace(solvers.k.solver, _b(k_eqn))
     @reset ω_eqn.solver = _workspace(solvers.omega.solver, _b(ω_eqn))
 
-    new_config = wall_distance!(model, model.wall_info, config)
+    new_config = if meshwave
+        wall_distance_meshwave!(model, model.wall_info, config)
+    else
+        wall_distance!(model, model.wall_info, config)
+    end
 
     initial_residual = ((:k, 1.0),(:omega, 1.0))
     return KOmegaSSTModel(k_eqn, ω_eqn, ModelState(initial_residual, false), β, σkf, σωf, γ, CDkω, arg1, F1, F1f, arg2, F2, Ω, ∇k, ∇ω), new_config
@@ -189,7 +194,7 @@ Run turbulence model transport equations.
 """
 function turbulence!(
     rans::KOmegaSSTModel{E1,E2,S1}, model::Physics{T,F,SO,M,Tu,E,D,BI}, S, prev, time, config;
-    boundedturb::Bool=false, wallfn_v2::Bool=false
+    boundedturb::Bool=false, wallfn_v2::Bool=false, wallfn_binomial::Bool=false
     ) where {T,F,SO,M,Tu<:AbstractTurbulenceModel,E,D,BI,E1,E2,S1}
 
     mesh = model.domain
@@ -273,7 +278,8 @@ function turbulence!(
         10*coeffs.β⁺*k.values*omega.values
     )
 
-    correct_production!(Pk, boundaries.k, model, S.gradU, config, wallfn_v2) # Must be after Pk
+    correct_production!(Pk, boundaries.k, model, S.gradU, config, wallfn_v2, wallfn_binomial) # Must be after Pk
+
     @. dkdomegadx.values = begin
         # 2*(F1.values - 1)*rho.values*coeffs.σω2*dkdomegadx.values/omega.values # explicit 
         2*(F1.values - 1)*rho.values*coeffs.σω2*dkdomegadx.values/omega.values/omega.values
@@ -293,13 +299,21 @@ function turbulence!(
     apply_boundary_conditions!(ω_eqn, boundaries.omega, nothing, time, config)
     # implicit_relaxation!(ω_eqn, omega.values, solvers.omega.relax, nothing, config)
     implicit_relaxation_diagdom!(ω_eqn, omega.values, solvers.omega.relax, nothing, config)
-    constrain_equation!(ω_eqn, boundaries.omega, model, config, wallfn_v2) # active with WFs only
+    constrain_equation!(ω_eqn, boundaries.omega, model, config, wallfn_v2, wallfn_binomial) # active with WFs only
     update_preconditioner!(ω_eqn.preconditioner, mesh, config)
     ω_res = solve_system!(ω_eqn, solvers.omega, omega, nothing, config)
     
     # constrain_boundary!(omega, omega.BCs, model, config) # active with WFs only
     bound!(omega, config)
     # explicit_relaxation!(omega, prev, solvers.omega.relax, config)
+
+    # Recompute the k-equation's dissipation coefficient using the just-solved
+    # omega, not the stale pre-solve value it was built with above. OpenFOAM's
+    # kOmegaSSTBase::correct() computes epsilonByk = betaStar*omega_ *inside*
+    # the k-equation block, which textually/temporally follows solve(omegaEqn)
+    # -- i.e. it always uses the current iteration's fresh omega for k's sink
+    # term, not the previous iteration's.
+    @. Dkf.values = rho.values*coeffs.β⁺*omega.values
 
     # Solve k equation
     # prev .= k.values
@@ -323,7 +337,7 @@ function turbulence!(
 
     interpolate!(nutf, nut, config)
     correct_boundaries!(nutf, nut, boundaries.nut, time, config)
-    correct_eddy_viscosity!(nutf, boundaries.nut, model, config, wallfn_v2)
+    correct_eddy_viscosity!(nutf, boundaries.nut, model, config, wallfn_v2, wallfn_binomial)
 
     state.residuals = ((:k , k_res),(:omega, ω_res))
     state.converged = k_res < solvers.k.convergence && ω_res < solvers.omega.convergence

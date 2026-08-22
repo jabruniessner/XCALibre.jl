@@ -89,7 +89,7 @@ Initialisation of turbulent transport equations.
 
 """
 function initialise(
-    turbulence::KOmega, model::Physics{T,F,SO,M,Tu,E,D,BI}, mdotf, peqn, config
+    turbulence::KOmega, model::Physics{T,F,SO,M,Tu,E,D,BI}, mdotf, peqn, config; kwargs...
     ) where {T,F,SO,M,Tu,E,D,BI}
 
     (; k, omega, nut) = turbulence

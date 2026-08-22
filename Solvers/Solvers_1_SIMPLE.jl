@@ -28,7 +28,7 @@ This function returns a `NamedTuple` for accessing the residuals (e.g. `residual
 function simple!(
     model, config;
     output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false,
-    boundedturb=false, wallfn_v2=false
+    boundedturb=false, wallfn_v2=false, wallfn_binomial=false
     )
 
     residuals = setup_incompressible_solvers(
@@ -40,7 +40,8 @@ function simple!(
         consistent=consistent,
         linearupwind=linearupwind,
         boundedturb=boundedturb,
-        wallfn_v2=wallfn_v2
+        wallfn_v2=wallfn_v2,
+        wallfn_binomial=wallfn_binomial
         )
 
     return residuals
@@ -50,7 +51,7 @@ end
 function setup_incompressible_solvers(
     solver_variant, model, config;
     output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false,
-    boundedturb=false, wallfn_v2=false
+    boundedturb=false, wallfn_v2=false, wallfn_binomial=false
     )
 
     (; solvers, schemes, runtime, hardware, boundaries) = config
@@ -105,7 +106,8 @@ function setup_incompressible_solvers(
         consistent=consistent,
         linearupwind=linearupwind,
         boundedturb=boundedturb,
-        wallfn_v2=wallfn_v2)
+        wallfn_v2=wallfn_v2,
+        wallfn_binomial=wallfn_binomial)
 
     return residuals
 end # end function
@@ -113,7 +115,7 @@ end # end function
 function SIMPLE(
     model, turbulenceModel, ∇p, U_eqn, p_eqn, config;
     output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false,
-    boundedturb=false, wallfn_v2=false
+    boundedturb=false, wallfn_v2=false, wallfn_binomial=false
     )
 
     if consistent
@@ -291,7 +293,7 @@ function SIMPLE(
         correct_mass_flux!(mdotf, p_eqn, config; time=time)
         correct_velocity!(U, Hv, ∇p, pCoeff, config)
 
-        turbulence!(turbulenceModel, model, S, prev, time, config; boundedturb=boundedturb, wallfn_v2=wallfn_v2)
+        turbulence!(turbulenceModel, model, S, prev, time, config; boundedturb=boundedturb, wallfn_v2=wallfn_v2, wallfn_binomial=wallfn_binomial)
         if linearupwind
             # OpenFOAM's actual scheme is `linearUpwindV grad(U)` with
             # `grad(U)  cellLimited Gauss linear 1;` -- the extrapolation
