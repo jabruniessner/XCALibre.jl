@@ -250,12 +250,9 @@ function SIMPLE(
         remove_pressure_source!(U_eqn, ∇p, config)
         H!(Hv, U, U_eqn, config)
 
-        if consistent
-            # HbyA -= (rAU - rAtU)*grad(p)  (using the still-previous-iteration ∇p)
-            simplec_correct_Hv!(Hv, rD, rAtU, ∇p, config)
-        end
-
-        # Interpolate faces
+        # Interpolate faces (from the *uncorrected* Hv -- matches OpenFOAM's
+        # phiHbyA = fvc::flux(HbyA), computed before the consistent-branch
+        # correction is applied to HbyA)
         interpolate!(Uf, Hv, config) # Careful: reusing Uf for interpolation
         correct_boundaries!(Uf, Hv, boundaries.U, time, config)
 
@@ -264,6 +261,27 @@ function SIMPLE(
 
         # new approach
         flux!(mdotf, Uf, config)
+
+        if consistent
+            # SIMPLEC: correct the face flux directly with an snGrad(p)-based
+            # term, matching OpenFOAM's
+            # phiHbyA += fvc::interpolate(rAtU()-rAU)*fvc::snGrad(p)*magSf.
+            # This uses the same orthogonal-part face geometry (Ef_mag/delta)
+            # as the p Laplacian discretisation itself, i.e. a face-normal
+            # two-point pressure gradient -- NOT the interpolated cell
+            # gradient used by simplec_correct_Hv! below. Building mdotf from
+            # the Hv-corrected route alone (as before) implicitly substitutes
+            # interpolate(cell_grad(p))·Sf for snGrad(p)*magSf, which only
+            # agrees with OpenFOAM's operator on a uniform mesh -- they
+            # diverge on a graded mesh, exactly where this matters most.
+            simplec_flux_correction!(mdotf, rD, rAtU, p, config)
+
+            # HbyA -= (rAU - rAtU)*grad(p) (using the still-previous-iteration
+            # ∇p) -- corrects the *cell* field only, used later purely for
+            # the post-solve velocity reconstruction (correct_velocity!), not
+            # for building mdotf/divHv above.
+            simplec_correct_Hv!(Hv, rD, rAtU, ∇p, config)
+        end
 
         div!(divHv, mdotf, config)
         
@@ -459,6 +477,64 @@ end
         Hx[i] -= delta * dpdx[i]
         Hy[i] -= delta * dpdy[i]
         Hz[i] -= delta * dpdz[i]
+    end
+end
+
+# SIMPLEC face-flux correction: mdotf += interpolate(rAtU - rD) * snGrad(p) *
+# magSf, matching OpenFOAM pEqn.H's
+# `phiHbyA += fvc::interpolate(rAtU()-rAU)*fvc::snGrad(p)*mesh.magSf();`.
+# snGrad(p)*magSf is built from the same orthogonal-part face geometry
+# (Ef_mag/delta, using dPN and the face normal) as the Laplacian(p)
+# discretisation in Discretise_1_schemes.jl, so this correction is
+# numerically consistent with the operator the pressure equation is actually
+# solved with -- unlike interpolating a cell-reconstructed grad(p) to the
+# face, which only agrees with this on a uniform mesh.
+function simplec_flux_correction!(mdotf, rD, rAtU, p, config)
+    mesh = mdotf.mesh
+    (; faces, cells, boundary_cellsID) = mesh
+    (; hardware) = config
+    (; backend, workgroup) = hardware
+
+    n_faces = length(faces)
+    n_bfaces = length(boundary_cellsID)
+    n_ifaces = n_faces - n_bfaces
+
+    ndrange = n_ifaces
+    kernel! = _simplec_flux_correction!(_setup(backend, workgroup, ndrange)...)
+    kernel!(mdotf, rD, rAtU, p, faces, cells, n_bfaces)
+end
+
+@kernel function _simplec_flux_correction!(mdotf, rD, rAtU, p, faces, cells, n_bfaces)
+    i = @index(Global)
+    @uniform begin
+        mvals = mdotf.values
+        pvals = p.values
+        rDvals = rD.values
+        rAtUvals = rAtU.values
+    end
+    @inbounds begin
+        fID = i + n_bfaces
+        face = faces[fID]
+        (; ownerCells, area, normal, weight) = face
+        cID1 = ownerCells[1] # owner
+        cID2 = ownerCells[2] # neighbour
+
+        # Ef_mag_over_delta == norm(Ef)/delta, the same orthogonal-part
+        # geometric factor the Laplacian(p) scheme uses for its implicit
+        # coefficient (Discretise_1_schemes.jl: ap = flux*Ef_mag/delta).
+        # Since delta == norm(dPN) (Mesh_1_functions.jl:weight_delta_e), the
+        # norm(dPN) factor in Ef_mag cancels against delta here -- do not
+        # divide by delta again below.
+        dPN = cells[cID2].centre - cells[cID1].centre
+        Ef_mag_over_delta = (norm(normal)^2/(dPN⋅normal))*area
+
+        # face.weight is the same owner-side linear-interpolation weight
+        # used by interpolate!() elsewhere (Calculate_2_interpolation.jl),
+        # kept consistent with how rDf is built for the non-consistent path.
+        rDf = weight*rDvals[cID1] + (one(weight) - weight)*rDvals[cID2]
+        rAtUf = weight*rAtUvals[cID1] + (one(weight) - weight)*rAtUvals[cID2]
+
+        Atomix.@atomic mvals[fID] += (rAtUf - rDf)*(pvals[cID2] - pvals[cID1])*Ef_mag_over_delta
     end
 end
 
