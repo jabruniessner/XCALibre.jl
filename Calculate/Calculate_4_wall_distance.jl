@@ -94,8 +94,11 @@ end
 # with the geometric distance by ~22% on average in near-wall cells -- and
 # y feeds directly into the kOmegaSST F1/F2 blending, eddy-viscosity limiter
 # and wall functions, so that mismatch propagates throughout the closure.
-# Host-side only (plain sequential loops); correct for backend=CPU() but not
-# GPU-parallelised.
+# The relaxation itself is plain sequential host-side loops (a one-off
+# pre-processing step, not per-iteration, so this isn't performance-critical)
+# -- mesh.cells/faces/boundaries/boundary_cellsID are pulled to the host with
+# Array(...)/get_boundaries(...) first since they live in device memory under
+# a GPU backend and scalar-indexing a CuArray directly errors.
 function wall_distance_meshwave!(model, walls, config; max_sweeps=100)
     @info "Calculating wall distance (geometric relaxation, meshWave-style)..."
 
@@ -116,22 +119,27 @@ function wall_distance_meshwave!(model, walls, config; max_sweeps=100)
 
     wall_names = collect(Symbol.(walls))
 
-    n_cells = length(mesh.cells)
+    cells_cpu = Array(mesh.cells)
+    faces_cpu = Array(mesh.faces)
+    boundaries_cpu = get_boundaries(mesh.boundaries)
+    boundary_cellsID_cpu = Array(mesh.boundary_cellsID)
+
+    n_cells = length(cells_cpu)
     yvals = fill(Inf, n_cells)
 
-    for b ∈ mesh.boundaries
+    for b ∈ boundaries_cpu
         if b.name ∈ wall_names
             for fID ∈ b.IDs_range
-                cID = mesh.boundary_cellsID[fID]
-                face = mesh.faces[fID]
-                d = norm(mesh.cells[cID].centre - face.centre)
+                cID = boundary_cellsID_cpu[fID]
+                face = faces_cpu[fID]
+                d = norm(cells_cpu[cID].centre - face.centre)
                 yvals[cID] = min(yvals[cID], d)
             end
         end
     end
 
-    n_bfaces = length(mesh.boundary_cellsID)
-    n_faces = length(mesh.faces)
+    n_bfaces = length(boundary_cellsID_cpu)
+    n_faces = length(faces_cpu)
 
     changed = true
     sweep = 0
@@ -139,9 +147,9 @@ function wall_distance_meshwave!(model, walls, config; max_sweeps=100)
         changed = false
         sweep += 1
         for fID ∈ (n_bfaces+1):n_faces
-            face = mesh.faces[fID]
+            face = faces_cpu[fID]
             c1, c2 = face.ownerCells[1], face.ownerCells[2]
-            d = norm(mesh.cells[c1].centre - mesh.cells[c2].centre)
+            d = norm(cells_cpu[c1].centre - cells_cpu[c2].centre)
             cand1 = yvals[c2] + d
             if cand1 < yvals[c1]
                 yvals[c1] = cand1
