@@ -75,7 +75,7 @@ function setup_incompressible_solvers(
     @info "Defining models..."
 
     U_eqn = if stresscorrection
-        @info "stresscorrection=true enabled: U_eqn carries the explicit deviatoric transpose-stress source -div(nueff*dev2(grad(U)^T)), matching OpenFOAM's divDevReff for incompressible turbulent flow."
+        @info "stresscorrection=true enabled: U_eqn carries the explicit deviatoric transpose-stress source +div(nueff*dev2(grad(U)^T)), matching OpenFOAM's divDevReff for incompressible turbulent flow (sign verified analytically from linearViscousStress.C's divDevRhoReff and confirmed empirically on motorBike: flipping it worsens both Cd and Cl)."
         mueffgradUt = VectorField(mesh)
         (
             Time{schemes.U.time}(U)
