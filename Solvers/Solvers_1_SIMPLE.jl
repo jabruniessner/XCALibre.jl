@@ -28,7 +28,7 @@ This function returns a `NamedTuple` for accessing the residuals (e.g. `residual
 function simple!(
     model, config;
     output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false,
-    boundedturb=false, wallfn_v2=false, wallfn_binomial=false
+    boundedturb=false, wallfn_v2=false, wallfn_binomial=false, stresscorrection=false, meshwave=false
     )
 
     residuals = setup_incompressible_solvers(
@@ -41,7 +41,9 @@ function simple!(
         linearupwind=linearupwind,
         boundedturb=boundedturb,
         wallfn_v2=wallfn_v2,
-        wallfn_binomial=wallfn_binomial
+        wallfn_binomial=wallfn_binomial,
+        stresscorrection=stresscorrection,
+        meshwave=meshwave
         )
 
     return residuals
@@ -51,7 +53,7 @@ end
 function setup_incompressible_solvers(
     solver_variant, model, config;
     output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false,
-    boundedturb=false, wallfn_v2=false, wallfn_binomial=false
+    boundedturb=false, wallfn_v2=false, wallfn_binomial=false, stresscorrection=false, meshwave=false
     )
 
     (; solvers, schemes, runtime, hardware, boundaries) = config
@@ -62,7 +64,7 @@ function setup_incompressible_solvers(
     mesh = model.domain
 
     @info "Pre-allocating fields..."
-    
+
     ∇p = Grad{schemes.p.gradient}(p)
     mdotf = FaceScalarField(mesh)
     rDf = FaceScalarField(mesh)
@@ -72,13 +74,26 @@ function setup_incompressible_solvers(
 
     @info "Defining models..."
 
-    U_eqn = (
-        Time{schemes.U.time}(U)
-        + Divergence{schemes.U.divergence}(mdotf, U) 
-        - Laplacian{schemes.U.laplacian}(nueff, U) 
-        == 
-        - Source(∇p.result)
-    ) → VectorEquation(U, boundaries.U)
+    U_eqn = if stresscorrection
+        @info "stresscorrection=true enabled: U_eqn carries the explicit deviatoric transpose-stress source -div(nueff*dev2(grad(U)^T)), matching OpenFOAM's divDevReff for incompressible turbulent flow."
+        mueffgradUt = VectorField(mesh)
+        (
+            Time{schemes.U.time}(U)
+            + Divergence{schemes.U.divergence}(mdotf, U)
+            - Laplacian{schemes.U.laplacian}(nueff, U)
+            ==
+            - Source(∇p.result)
+            + Source(mueffgradUt)
+        ) → VectorEquation(U, boundaries.U)
+    else
+        (
+            Time{schemes.U.time}(U)
+            + Divergence{schemes.U.divergence}(mdotf, U)
+            - Laplacian{schemes.U.laplacian}(nueff, U)
+            ==
+            - Source(∇p.result)
+        ) → VectorEquation(U, boundaries.U)
+    end
 
     p_eqn = (
         - Laplacian{schemes.p.laplacian}(rDf, p) == - Source(divHv)
@@ -95,7 +110,7 @@ function setup_incompressible_solvers(
     @reset p_eqn.solver = _workspace(solvers.p.solver, _b(p_eqn))
 
     @info "Initialising turbulence model..."
-    turbulenceModel, config = initialise(model.turbulence, model, mdotf, p_eqn, config)
+    turbulenceModel, config = initialise(model.turbulence, model, mdotf, p_eqn, config; meshwave=meshwave)
 
     residuals  = solver_variant(
         model, turbulenceModel, ∇p, U_eqn, p_eqn, config;
@@ -107,7 +122,8 @@ function setup_incompressible_solvers(
         linearupwind=linearupwind,
         boundedturb=boundedturb,
         wallfn_v2=wallfn_v2,
-        wallfn_binomial=wallfn_binomial)
+        wallfn_binomial=wallfn_binomial,
+        stresscorrection=stresscorrection)
 
     return residuals
 end # end function
@@ -115,7 +131,7 @@ end # end function
 function SIMPLE(
     model, turbulenceModel, ∇p, U_eqn, p_eqn, config;
     output=VTK(), pref=nothing, ncorrectors=0, inner_loops=0, consistent=false, linearupwind=false,
-    boundedturb=false, wallfn_v2=false, wallfn_binomial=false
+    boundedturb=false, wallfn_v2=false, wallfn_binomial=false, stresscorrection=false
     )
 
     if consistent
@@ -141,6 +157,17 @@ function SIMPLE(
     nueff = get_flux(U_eqn, 3)
     rDf = get_flux(p_eqn, 1)
     divHv = get_source(p_eqn, 1)
+
+    # stresscorrection: mugradUTx/y/z and divmugradUTx/y/z are only used to
+    # rebuild mueffgradUt each iteration (mirrors CSIMPLE's explicit
+    # deviatoric shear-stress term); left unallocated when disabled.
+    mueffgradUt = stresscorrection ? get_source(U_eqn, 2) : nothing
+    mugradUTx = stresscorrection ? FaceScalarField(mesh) : nothing
+    mugradUTy = stresscorrection ? FaceScalarField(mesh) : nothing
+    mugradUTz = stresscorrection ? FaceScalarField(mesh) : nothing
+    divmugradUTx = stresscorrection ? ScalarField(mesh) : nothing
+    divmugradUTy = stresscorrection ? ScalarField(mesh) : nothing
+    divmugradUTz = stresscorrection ? ScalarField(mesh) : nothing
 
     outputWriter = initialise_writer(output, model.domain)
     
@@ -185,6 +212,20 @@ function SIMPLE(
 
     for iteration ∈ 1:iterations
         time = iteration
+
+        if stresscorrection
+            # Uses gradU as of the end of the previous iteration (updated in
+            # turbulence! below), same timing CSIMPLE uses for this term.
+            explicit_shear_stress!(
+                mugradUTx, mugradUTy, mugradUTz, nueff, gradU, boundaries.U, config)
+            div!(divmugradUTx, mugradUTx, config)
+            div!(divmugradUTy, mugradUTy, config)
+            div!(divmugradUTz, mugradUTz, config)
+
+            @. mueffgradUt.x.values = divmugradUTx.values
+            @. mueffgradUt.y.values = divmugradUTy.values
+            @. mueffgradUt.z.values = divmugradUTz.values
+        end
 
         rx, ry, rz = solve_equation!(
             U_eqn, U, boundaries.U, solvers.U, xdir, ydir, zdir, config;
