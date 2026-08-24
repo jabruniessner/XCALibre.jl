@@ -53,7 +53,7 @@ function _apply_boundary_conditions!(
         kernel!(
             model, BCs,model.terms, faces, cells, boundary_cellsID, colval, rowptr, nzval, b, component, time, ndrange=ndrange
             )
-        KernelAbstractions.synchronize(backend)
+        # KernelAbstractions.synchronize(backend)
 
     # Loop over boundary conditions to apply boundary conditions 
     # for BC ∈ BCs
